@@ -1,0 +1,29 @@
+## macOS
+.DS_Store
+
+## User settings
+xcuserdata/
+
+## Build
+DerivedData/
+
+## Obj-C/Swift specific
+*.hmap
+
+## App packaging
+*.ipa
+*.dSYM.zip
+*.dSYM
+
+## Playgrounds
+timeline.xctimeline
+playground.xcworkspace
+
+# Swift Package Manager
+.build/
+
+## Internal docs
+docs/plans/
+
+## Claude Code
+.claude/settings.local.json
