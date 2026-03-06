@@ -63,3 +63,7 @@ Each time you open the popover, it fetches fresh usage data.
 ## License
 
 MIT
+
+---
+
+⭐ If this tool helps you avoid hitting Claude limits, consider giving it a star!
