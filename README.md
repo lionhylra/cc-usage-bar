@@ -34,6 +34,18 @@ There is no API scraping, no token parsing, no reverse engineering. The data com
 
 ## Install
 
+### Download (recommended)
+
+1. Download the latest `CCUsageBar.zip` from the [Releases](../../releases) page
+2. Unzip and move `CCUsageBar.app` to your `/Applications` folder
+
+> **Note:** Since this app is not notarized, macOS Gatekeeper will block it on first launch.
+> To open it, either:
+> - Right-click the app → **Open** → **Open**
+> - Or run in Terminal: `xattr -d com.apple.quarantine /Applications/CCUsageBar.app`
+
+### Build from source
+
 1. Clone the repository
 2. Open `CCUsageBar/CCUsageBar.xcodeproj` in Xcode
 3. Build and run (Cmd+R)
