@@ -6,7 +6,13 @@ A minimal macOS menu bar app that shows your [Claude Code](https://claude.com/cl
 
 ## Why
 
-Claude Code doesn't expose a persistent usage indicator. The only way to check is to open a session and type `/usage`. This app puts that information one click away in your menu bar — always up to date, always accurate.
+Claude Code doesn't expose a persistent usage indicator. The only way to check is to open a session and type `/usage`. When you're running multiple Claude Code sessions across different terminal windows, checking your usage means either interrupting a running agent mid-task or opening a new terminal just to see a number. Both are disruptive.
+
+Many community tools solve this by reading the OAuth token from the macOS Keychain and calling Anthropic's usage API directly. But macOS will prompt you every time a third-party app tries to access that Keychain item — not a smooth experience, and handing your OAuth token to another process is a legitimate security concern.
+
+This project was entirely vibe-coded using Claude Code itself — which is also how I ran into the problem in the first place.
+
+CC Usage Bar takes a different approach. It doesn't touch your Keychain or make any network calls itself. It simply runs `claude` the same way you would, captures the `/usage` output, and displays it in your menu bar — one click away, always accurate.
 
 ## How it works
 
@@ -21,11 +27,11 @@ There is no API scraping, no token parsing, no reverse engineering. The data com
 
 ## Features
 
-- **Minimal** — a single menu bar icon, one popover, no windows
-- **Accurate** — reads directly from Claude Code's own `/usage` output
-- **Safe** — no network calls, no credentials stored, no hacks; just runs `claude` the same way you would
-- **Zero setup** — install, open, click the icon (requires Claude Code already configured on your machine)
-- **Native** — built in Swift with SwiftUI, runs as a lightweight menu bar agent
+- 🪶 **Minimal** — a single menu bar icon, one popover, no windows
+- 🎯 **Accurate** — reads directly from Claude Code's own `/usage` output
+- 🔒 **Safe** — no API calls, no credentials stored, no hacks; just runs `claude` the same way you would
+- ⚡ **Zero setup** — install, open, click the icon (requires Claude Code already configured on your machine)
+- 🍎 **Native** — built in Swift with SwiftUI, runs as a lightweight menu bar agent
 
 ## Requirements
 
