@@ -193,6 +193,10 @@ final class UsageViewModel: ObservableObject {
             let exitStatus = status
             Task { @MainActor [weak self] in
                 guard let self else { return }
+                // Only surface an exit error if we haven't already successfully loaded.
+                // Closing the PTY master (in finalize) sends SIGHUP to claude, causing
+                // zsh to exit with code 129 — which is expected and not an error.
+                guard case .loading = self.state else { return }
                 if swiftWIFEXITED(exitStatus) && swiftWEXITSTATUS(exitStatus) != 0 {
                     let code = swiftWEXITSTATUS(exitStatus)
                     self.state = .error("claude exited with code \(code). Is it installed and on your PATH?")
