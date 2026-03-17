@@ -1,6 +1,9 @@
 import AppKit
 import Combine
 import Darwin
+import OSLog
+
+private let log = Logger(subsystem: "com.ccusagebar", category: "UsageViewModel")
 
 // fork() is marked unavailable in Swift for thread-safety reasons, but we need it for PTY.
 // Access it via dlsym to bypass the Swift-level unavailability annotation.
@@ -34,6 +37,7 @@ final class UsageViewModel: ObservableObject {
     @Published var state: UsageState = .idle
 
     private enum Stage {
+        case idle               // session alive, no active query — discard incoming data
         case waitingForBanner   // waiting for "Claude Code v2"
         case waitingForResult   // sent /usage, waiting for "Current session"
         case capturing          // collecting final output
@@ -44,17 +48,65 @@ final class UsageViewModel: ObservableObject {
     private var readSource: DispatchSourceRead?
     private var timeoutWork: DispatchWorkItem?
     private var idleWork: DispatchWorkItem?
-    private var stage: Stage = .waitingForBanner
+    private var stage: Stage = .idle
     private var scanBuffer = ""
     private var accumulatedData = Data()
 
+    // Incremented on every run(). Every async callback (Task, DispatchWorkItem) captures
+    // the ID at creation time and bails out if it no longer matches — preventing stale
+    // callbacks from a previous query from clobbering the new one.
+    private var queryId = 0
+
+    private var sessionLive: Bool { childPid > 0 && masterFd >= 0 }
+
     func run() {
-        cancelCurrent()
+        cancelQuery()
+        queryId += 1
+        let currentQueryId = queryId
+        log.info("run() qid=\(currentQueryId) sessionLive=\(self.sessionLive) pid=\(self.childPid) fd=\(self.masterFd)")
+
+        // Cancel and recreate the read source for each query.
+        // A DispatchSourceRead on a PTY master FD can lose its kqueue registration
+        // after extended inactivity on macOS, causing it to silently stop firing even
+        // when new data arrives. Recreating it guarantees a fresh kernel event filter.
+        readSource?.cancel()
+        readSource = nil
+
         accumulatedData = Data()
         scanBuffer = ""
-        stage = .waitingForBanner
         state = .loading
 
+        if sessionLive {
+            // Reuse the existing claude session — send /usage directly.
+            log.info("run() reusing session fd=\(self.masterFd)")
+            stage = .waitingForResult
+            let capturedMaster = masterFd
+            readSource = makeReadSource(master: capturedMaster, queryId: currentQueryId)
+            readSource?.resume()
+
+            // ESC was already sent on popover dismiss (see dismissPopover()), so the
+            // REPL is back at the › prompt. Mirror the first-launch timing with a short
+            // delay before the command and a separate newline write.
+            log.info("write /usage fd=\(capturedMaster)")
+            let n = "/usage".withCString { ptr in write(capturedMaster, ptr, strlen(ptr)) }
+            log.info("write /usage result=\(n) errno=\(errno)")
+            DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + 0.3) {
+                log.info("write \\r fd=\(capturedMaster)")
+                let n2 = "\r".withCString { ptr in write(capturedMaster, ptr, strlen(ptr)) }
+                log.info("write \\r result=\(n2) errno=\(errno)")
+            }
+            scheduleTimeout(queryId: currentQueryId)
+        } else {
+            // Launch a fresh claude session.
+            log.info("run() launching fresh session")
+            stage = .waitingForBanner
+            launchSession(queryId: currentQueryId)
+        }
+    }
+
+    // MARK: - Session launch
+
+    private func launchSession(queryId: Int) {
         // Open PTY master
         let master = posix_openpt(O_RDWR | O_NOCTTY)
         guard master >= 0, grantpt(master) == 0, unlockpt(master) == 0 else {
@@ -78,6 +130,7 @@ final class UsageViewModel: ObservableObject {
         let pid = _fork()
         guard pid >= 0 else {
             close(master)
+            masterFd = -1
             state = .error("fork() failed: \(String(cString: strerror(errno)))")
             return
         }
@@ -108,58 +161,107 @@ final class UsageViewModel: ObservableObject {
             _exit(127)
         }
 
-        // Parent: read from PTY master asynchronously
+        // Parent: attach read source and start monitoring
         childPid = pid
-        let capturedMaster = master
+        log.info("launchSession() forked pid=\(pid) fd=\(master)")
+        readSource = makeReadSource(master: master, queryId: queryId)
+        readSource?.resume()
 
+        scheduleTimeout(queryId: queryId)
+
+        // Safety net: if claude exits unexpectedly, surface the error and mark session dead.
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            var status: Int32 = 0
+            waitpid(pid, &status, 0)
+            let exitStatus = status
+            Task { @MainActor [weak self] in
+                log.info("waitpid returned pid=\(pid) status=\(exitStatus) WIFEXITED=\(swiftWIFEXITED(exitStatus)) code=\(swiftWEXITSTATUS(exitStatus))")
+                guard let self else { return }
+                // Mark session dead if we haven't already replaced it with a new one.
+                if self.childPid == pid {
+                    log.info("marking session dead (childPid was \(pid))")
+                    self.childPid = 0
+                }
+                // Only surface an exit error if we were actively loading.
+                // Closing the PTY master (in teardownSession) sends SIGHUP to claude,
+                // causing zsh to exit — expected and not an error.
+                guard case .loading = self.state else { return }
+                if swiftWIFEXITED(exitStatus) && swiftWEXITSTATUS(exitStatus) != 0 {
+                    let code = swiftWEXITSTATUS(exitStatus)
+                    self.state = .error("claude exited with code \(code). Is it installed and on your PATH?")
+                    self.teardownSession()
+                }
+            }
+        }
+    }
+
+    // MARK: - Read source
+
+    private func makeReadSource(master: Int32, queryId: Int) -> DispatchSourceRead {
         let source = DispatchSource.makeReadSource(
             fileDescriptor: master,
             queue: .global(qos: .userInitiated)
         )
         source.setEventHandler { [weak self] in
             var buf = [UInt8](repeating: 0, count: 4096)
-            let n = read(capturedMaster, &buf, buf.count)
-            guard n > 0 else { return }
+            let n = read(master, &buf, buf.count)
+            if n <= 0 {
+                log.warning("read() returned \(n) errno=\(errno) fd=\(master) qid=\(queryId)")
+                return
+            }
             let chunk = Data(buf[0..<n])
+            log.debug("read \(n) bytes qid=\(queryId)")
             Task { @MainActor [weak self] in
-                guard let self else { return }
+                // Discard events from a previous query's source that fired after run()
+                // incremented queryId and installed a fresh source.
+                guard let self, self.queryId == queryId else {
+                    log.debug("discarding stale event (currentQid=\(self?.queryId ?? -1) eventQid=\(queryId))")
+                    return
+                }
                 let text = String(data: chunk, encoding: .utf8)
                     ?? String(data: chunk, encoding: .isoLatin1)
                     ?? ""
                 self.scanBuffer += self.stripANSI(text)
+                log.debug("stage=\(String(describing: self.stage)) scanBuf=\(self.scanBuffer.suffix(80))")
                 switch self.stage {
+                case .idle:
+                    // Session alive but no active query — discard output.
+                    break
                 case .waitingForBanner:
                     if self.scanBuffer.contains("Welcome to Claude Code")
                         || self.scanBuffer.contains("Choose the text style that looks best with your terminal")
                         || self.scanBuffer.contains("Claude Code can be used with your Claude subscription") {
+                        log.info("→ needsSetup detected")
                         self.state = .needsSetup
-                        self.cancelCurrent()
+                        self.teardownSession()
                         return
                     }
                     if self.scanBuffer.contains("Quick safety check") {
                         // Optional trust prompt — confirm and reset scan to await the banner.
+                        log.info("→ trust prompt, sending \\r")
                         self.scanBuffer = ""
                         DispatchQueue.global(qos: .userInitiated).async {
-                            "\r".withCString { ptr in _ = write(capturedMaster, ptr, strlen(ptr)) }
+                            "\r".withCString { ptr in _ = write(master, ptr, strlen(ptr)) }
                         }
                     } else if self.scanBuffer.range(of: "Claude Code v\\d+", options: .regularExpression) != nil {
+                        log.info("→ banner detected, sending /usage")
                         self.stage = .waitingForResult
                         // Delay before sending command — the banner appears before the REPL
                         // is fully interactive. Send /usage then \r with a short gap.
+                        "/usage".withCString { ptr in _ = write(master, ptr, strlen(ptr)) }
                         DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + 0.3) {
-                            "/usage".withCString { ptr in _ = write(capturedMaster, ptr, strlen(ptr)) }
-                            DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + 0.3) {
-                                "\r".withCString { ptr in _ = write(capturedMaster, ptr, strlen(ptr)) }
-                            }
+                            "\r".withCString { ptr in _ = write(master, ptr, strlen(ptr)) }
                         }
                     }
                 case .waitingForResult:
                     if self.scanBuffer.contains("rate_limit_error") {
+                        log.info("→ rate_limit_error detected")
                         self.state = .rateLimited
-                        self.cancelCurrent()
+                        self.teardownSession()
                         return
                     }
                     if self.scanBuffer.contains("Current session") {
+                        log.info("→ 'Current session' detected, entering capturing")
                         self.stage = .capturing
                         self.accumulatedData = Data()
                         self.scanBuffer = ""
@@ -179,81 +281,56 @@ final class UsageViewModel: ObservableObject {
                                 }
                             }
                         }
-                        self.rescheduleIdleTimer()
+                        self.rescheduleIdleTimer(queryId: queryId)
                     }
                 case .capturing:
                     self.accumulatedData.append(chunk)
-                    self.rescheduleIdleTimer()
+                    self.rescheduleIdleTimer(queryId: queryId)
                 }
             }
         }
-        source.setCancelHandler { [weak self] in
-            Task { @MainActor [weak self] in
-                self?.finalize()
-            }
-        }
-        source.resume()
-        readSource = source
+        return source
+    }
 
-        // 30-second timeout
+    // MARK: - Timers
+
+    private func scheduleTimeout(queryId: Int) {
+        let capturedId = queryId
         let timeout = DispatchWorkItem { [weak self] in
-            self?.handleTimeout()
+            self?.handleTimeout(queryId: capturedId)
         }
         DispatchQueue.main.asyncAfter(deadline: .now() + 30, execute: timeout)
         timeoutWork = timeout
-
-        // Safety net: if claude exits unexpectedly with non-zero code, surface the error.
-        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            var status: Int32 = 0
-            waitpid(pid, &status, 0)
-            let exitStatus = status
-            Task { @MainActor [weak self] in
-                guard let self else { return }
-                // Only surface an exit error if we haven't already successfully loaded.
-                // Closing the PTY master (in finalize) sends SIGHUP to claude, causing
-                // zsh to exit with code 129 — which is expected and not an error.
-                guard case .loading = self.state else { return }
-                if swiftWIFEXITED(exitStatus) && swiftWEXITSTATUS(exitStatus) != 0 {
-                    let code = swiftWEXITSTATUS(exitStatus)
-                    self.state = .error("claude exited with code \(code). Is it installed and on your PATH?")
-                    self.cancelCurrent()
-                }
-                // Zero exit or signal: idle timer already handled finalize, nothing to do.
-            }
-        }
     }
 
-    private func stripANSI(_ text: String) -> String {
-        // Replace ANSI sequences with a space (not empty) so cursor-movement commands
-        // between words don't cause adjacent words to merge together.
-        let stripped = text.replacingOccurrences(
-            of: "\u{1B}(?:\\[[^@-~]*[@-~]|[^\\[])",
-            with: " ",
-            options: .regularExpression
-        )
-        // Collapse runs of spaces/tabs to a single space so trigger strings match cleanly.
-        return stripped.replacingOccurrences(of: "[ \t]+", with: " ", options: .regularExpression)
-    }
-
-    private func rescheduleIdleTimer() {
+    private func rescheduleIdleTimer(queryId: Int) {
         idleWork?.cancel()
+        let capturedId = queryId
         let work = DispatchWorkItem { [weak self] in
             Task { @MainActor [weak self] in
-                self?.readSource?.cancel()  // triggers finalize() via cancel handler
+                self?.finalize(queryId: capturedId)
             }
         }
         idleWork = work
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.5, execute: work)
     }
 
-    private func finalize() {
+    // MARK: - Finalization
+
+    private func finalize(queryId: Int) {
+        // Discard stale finalize calls: either from a previous query (queryId mismatch)
+        // or from a race where run() changed the stage before this Task ran.
+        guard self.queryId == queryId, stage == .capturing else {
+            log.info("finalize() skipped qid=\(queryId) currentQid=\(self.queryId) stage=\(String(describing: self.stage))")
+            return
+        }
+        log.info("finalize() executing qid=\(queryId) accumulatedBytes=\(self.accumulatedData.count)")
         timeoutWork?.cancel()
         timeoutWork = nil
         idleWork?.cancel()
         idleWork = nil
-        // Close the master fd here — this is the terminal cleanup point for the fd.
-        // cancelCurrent() also guards with >= 0, so double-close is safe.
-        if masterFd >= 0 { close(masterFd); masterFd = -1 }
+        stage = .idle
+        // PTY and process are kept alive for the next query.
         guard case .loading = state else { return }
         let raw = String(data: accumulatedData, encoding: .utf8)
             ?? String(data: accumulatedData, encoding: .isoLatin1)
@@ -272,24 +349,69 @@ final class UsageViewModel: ObservableObject {
         }
     }
 
-    private func handleTimeout() {
+    private func handleTimeout(queryId: Int) {
+        guard self.queryId == queryId else {
+            log.info("handleTimeout() skipped stale qid=\(queryId)")
+            return
+        }
+        log.error("handleTimeout() fired qid=\(queryId) stage=\(String(describing: self.stage))")
         let stageName: String
         switch stage {
-        case .waitingForBanner:    stageName = "waitingForBanner"
-        case .waitingForResult:    stageName = "waitingForResult"
-        case .capturing:           stageName = "capturing"
+        case .idle:             stageName = "idle"
+        case .waitingForBanner: stageName = "waitingForBanner"
+        case .waitingForResult: stageName = "waitingForResult"
+        case .capturing:        stageName = "capturing"
         }
         let tail = String(scanBuffer.suffix(500))
-        // Set error BEFORE cancelling so finalize()'s guard exits early.
+        // Set error BEFORE tearing down so finalize()'s guard exits early.
         state = .error("Timed out (stage: \(stageName))\n\nLast output:\n\(tail)")
-        cancelCurrent()
+        teardownSession()
     }
 
-    func cancelCurrent() {
+    // MARK: - ANSI
+
+    private func stripANSI(_ text: String) -> String {
+        // Replace ANSI sequences with a space (not empty) so cursor-movement commands
+        // between words don't cause adjacent words to merge together.
+        let stripped = text.replacingOccurrences(
+            of: "\u{1B}(?:\\[[^@-~]*[@-~]|[^\\[])",
+            with: " ",
+            options: .regularExpression
+        )
+        // Collapse runs of spaces/tabs to a single space so trigger strings match cleanly.
+        return stripped.replacingOccurrences(of: "[ \t]+", with: " ", options: .regularExpression)
+    }
+
+    // MARK: - Session lifecycle
+
+    /// Called when the popover is dismissed. Sends ESC to exit the /usage view so
+    /// the REPL is back at the › prompt before the next query, then cancels timers.
+    func dismissPopover() {
+        if sessionLive {
+            let fd = masterFd
+            log.info("dismissPopover() sending ESC fd=\(fd)")
+            DispatchQueue.global(qos: .userInitiated).async {
+                "\u{1B}".withCString { ptr in _ = write(fd, ptr, strlen(ptr)) }
+            }
+        }
+        cancelQuery()
+    }
+
+    /// Cancels any in-progress query timers but keeps the claude session alive.
+    func cancelQuery() {
+        log.info("cancelQuery() stage=\(String(describing: self.stage))")
         timeoutWork?.cancel()
         timeoutWork = nil
         idleWork?.cancel()
         idleWork = nil
+        stage = .idle
+    }
+
+    /// Full teardown: kills the claude process and closes the PTY.
+    /// Called on timeout, rate-limit errors, and needs-setup conditions.
+    func teardownSession() {
+        log.info("teardownSession() pid=\(self.childPid) fd=\(self.masterFd)")
+        cancelQuery()
         readSource?.cancel()
         readSource = nil
         if childPid > 0 { kill(childPid, SIGTERM); childPid = 0 }

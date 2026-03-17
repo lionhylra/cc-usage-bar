@@ -51,7 +51,7 @@ final class StatusBarController: NSObject, NSPopoverDelegate {
 
     func popoverDidClose(_ notification: Notification) {
         stopClickMonitor()
-        viewModel.cancelCurrent()
+        viewModel.dismissPopover()
     }
 
     @objc private func togglePopover(_ sender: Any?) {
