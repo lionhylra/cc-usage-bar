@@ -161,8 +161,24 @@ final class UsageViewModel: ObservableObject {
                     }
                     if self.scanBuffer.contains("Current session") {
                         self.stage = .capturing
-                        self.accumulatedData = chunk
+                        self.accumulatedData = Data()
                         self.scanBuffer = ""
+                        // Force Ink to do a full re-render. Ink optimizes redraws
+                        // by skipping unchanged characters with cursor-forward,
+                        // but those skipped cells are blank in our virtual screen
+                        // parser. A PTY resize sends SIGWINCH which makes Ink
+                        // clear and redraw with every character written explicitly.
+                        let fd = self.masterFd
+                        if fd >= 0 {
+                            DispatchQueue.global(qos: .userInitiated).async {
+                                var ws = winsize(ws_row: 24, ws_col: 67, ws_xpixel: 0, ws_ypixel: 0)
+                                _ = ioctl(fd, UInt(TIOCSWINSZ), &ws)
+                                DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + 0.05) {
+                                    var ws = winsize(ws_row: 24, ws_col: 68, ws_xpixel: 536, ws_ypixel: 0)
+                                    _ = ioctl(fd, UInt(TIOCSWINSZ), &ws)
+                                }
+                            }
+                        }
                         self.rescheduleIdleTimer()
                     }
                 case .capturing:
@@ -242,7 +258,18 @@ final class UsageViewModel: ObservableObject {
         let raw = String(data: accumulatedData, encoding: .utf8)
             ?? String(data: accumulatedData, encoding: .isoLatin1)
             ?? ""
-        state = .loaded(ANSIParser.parse(raw))
+        let fullAttr = ANSIParser.parse(raw)
+        // The SIGWINCH re-render includes the full Ink UI (input area,
+        // tab bar, content). Trim to start from "Current session".
+        let plain = fullAttr.string
+        if let range = plain.range(of: "Current session") {
+            let lineStart = plain[..<range.lowerBound].lastIndex(of: "\n")
+                .map { plain.index(after: $0) }
+                ?? plain.startIndex
+            state = .loaded(fullAttr.attributedSubstring(from: NSRange(lineStart..<plain.endIndex, in: plain)))
+        } else {
+            state = .loaded(fullAttr)
+        }
     }
 
     private func handleTimeout() {
