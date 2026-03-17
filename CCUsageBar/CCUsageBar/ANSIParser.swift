@@ -211,6 +211,12 @@ enum ANSIParser {
             }
         }
 
+        // Cache the four font variants to avoid allocating NSFont per character.
+        let fontPlain = baseFont
+        let fontBold = NSFont(descriptor: baseFont.fontDescriptor.withSymbolicTraits(.bold), size: baseFont.pointSize) ?? baseFont
+        let fontItalic = NSFont(descriptor: baseFont.fontDescriptor.withSymbolicTraits(.italic), size: baseFont.pointSize) ?? baseFont
+        let fontBoldItalic = NSFont(descriptor: baseFont.fontDescriptor.withSymbolicTraits([.bold, .italic]), size: baseFont.pointSize) ?? baseFont
+
         for r in 0...max(lastNonBlankRow, 0) {
             // Find last non-space column to trim trailing spaces
             var lastCol = -1
@@ -220,11 +226,13 @@ enum ANSIParser {
 
             for c in 0...max(lastCol, 0) {
                 let cell = screen[r][c]
-                var traits: NSFontDescriptor.SymbolicTraits = []
-                if cell.isBold { traits.insert(.bold) }
-                if cell.isItalic { traits.insert(.italic) }
-                let descriptor = baseFont.fontDescriptor.withSymbolicTraits(traits)
-                let font = NSFont(descriptor: descriptor, size: baseFont.pointSize) ?? baseFont
+                let font: NSFont
+                switch (cell.isBold, cell.isItalic) {
+                case (false, false): font = fontPlain
+                case (true,  false): font = fontBold
+                case (false, true):  font = fontItalic
+                case (true,  true):  font = fontBoldItalic
+                }
                 var attrs: [NSAttributedString.Key: Any] = [
                     .font: font,
                     .foregroundColor: cell.color

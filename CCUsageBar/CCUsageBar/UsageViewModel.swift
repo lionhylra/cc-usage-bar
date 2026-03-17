@@ -23,6 +23,19 @@ private let _fork: @convention(c) () -> pid_t = {
     return (status >> 8) & 0xff
 }
 
+/// Write a string to a PTY file descriptor.
+@discardableResult
+private func ptySend(_ text: String, to fd: Int32) -> Int {
+    text.withCString { ptr in write(fd, ptr, strlen(ptr)) }
+}
+
+/// Decode PTY output bytes, falling back to Latin-1 if not valid UTF-8.
+private func decode(_ data: Data) -> String {
+    String(data: data, encoding: .utf8)
+        ?? String(data: data, encoding: .isoLatin1)
+        ?? ""
+}
+
 enum UsageState {
     case idle
     case loading
@@ -88,11 +101,11 @@ final class UsageViewModel: ObservableObject {
             // REPL is back at the › prompt. Mirror the first-launch timing with a short
             // delay before the command and a separate newline write.
             log.info("write /usage fd=\(capturedMaster)")
-            let n = "/usage".withCString { ptr in write(capturedMaster, ptr, strlen(ptr)) }
+            let n = ptySend("/usage", to: capturedMaster)
             log.info("write /usage result=\(n) errno=\(errno)")
             DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + 0.3) {
                 log.info("write \\r fd=\(capturedMaster)")
-                let n2 = "\r".withCString { ptr in write(capturedMaster, ptr, strlen(ptr)) }
+                let n2 = ptySend("\r", to: capturedMaster)
                 log.info("write \\r result=\(n2) errno=\(errno)")
             }
             scheduleTimeout(queryId: currentQueryId)
@@ -218,15 +231,17 @@ final class UsageViewModel: ObservableObject {
                     log.debug("discarding stale event (currentQid=\(self?.queryId ?? -1) eventQid=\(queryId))")
                     return
                 }
-                let text = String(data: chunk, encoding: .utf8)
-                    ?? String(data: chunk, encoding: .isoLatin1)
-                    ?? ""
+                // Session alive but no active query — discard without regex work.
+                if case .idle = self.stage {
+                    self.scanBuffer = ""
+                    return
+                }
+                let text = decode(chunk)
                 self.scanBuffer += self.stripANSI(text)
                 log.debug("stage=\(String(describing: self.stage)) scanBuf=\(self.scanBuffer.suffix(80))")
                 switch self.stage {
                 case .idle:
-                    // Session alive but no active query — discard output.
-                    break
+                    break  // handled above — unreachable
                 case .waitingForBanner:
                     if self.scanBuffer.contains("Welcome to Claude Code")
                         || self.scanBuffer.contains("Choose the text style that looks best with your terminal")
@@ -241,16 +256,16 @@ final class UsageViewModel: ObservableObject {
                         log.info("→ trust prompt, sending \\r")
                         self.scanBuffer = ""
                         DispatchQueue.global(qos: .userInitiated).async {
-                            "\r".withCString { ptr in _ = write(master, ptr, strlen(ptr)) }
+                            ptySend("\r", to: master)
                         }
                     } else if self.scanBuffer.range(of: "Claude Code v\\d+", options: .regularExpression) != nil {
                         log.info("→ banner detected, sending /usage")
                         self.stage = .waitingForResult
                         // Delay before sending command — the banner appears before the REPL
                         // is fully interactive. Send /usage then \r with a short gap.
-                        "/usage".withCString { ptr in _ = write(master, ptr, strlen(ptr)) }
+                        ptySend("/usage", to: master)
                         DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + 0.3) {
-                            "\r".withCString { ptr in _ = write(master, ptr, strlen(ptr)) }
+                            ptySend("\r", to: master)
                         }
                     }
                 case .waitingForResult:
@@ -287,6 +302,11 @@ final class UsageViewModel: ObservableObject {
                     self.accumulatedData.append(chunk)
                     self.rescheduleIdleTimer(queryId: queryId)
                 }
+                // Prevent unbounded growth while waiting for a trigger string.
+                // No trigger string is longer than a few hundred characters.
+                if self.scanBuffer.count > 4096 {
+                    self.scanBuffer = String(self.scanBuffer.suffix(2048))
+                }
             }
         }
         return source
@@ -295,9 +315,8 @@ final class UsageViewModel: ObservableObject {
     // MARK: - Timers
 
     private func scheduleTimeout(queryId: Int) {
-        let capturedId = queryId
         let timeout = DispatchWorkItem { [weak self] in
-            self?.handleTimeout(queryId: capturedId)
+            self?.handleTimeout(queryId: queryId)
         }
         DispatchQueue.main.asyncAfter(deadline: .now() + 30, execute: timeout)
         timeoutWork = timeout
@@ -305,10 +324,9 @@ final class UsageViewModel: ObservableObject {
 
     private func rescheduleIdleTimer(queryId: Int) {
         idleWork?.cancel()
-        let capturedId = queryId
         let work = DispatchWorkItem { [weak self] in
             Task { @MainActor [weak self] in
-                self?.finalize(queryId: capturedId)
+                self?.finalize(queryId: queryId)
             }
         }
         idleWork = work
@@ -325,16 +343,10 @@ final class UsageViewModel: ObservableObject {
             return
         }
         log.info("finalize() executing qid=\(queryId) accumulatedBytes=\(self.accumulatedData.count)")
-        timeoutWork?.cancel()
-        timeoutWork = nil
-        idleWork?.cancel()
-        idleWork = nil
-        stage = .idle
+        cancelQuery()
         // PTY and process are kept alive for the next query.
         guard case .loading = state else { return }
-        let raw = String(data: accumulatedData, encoding: .utf8)
-            ?? String(data: accumulatedData, encoding: .isoLatin1)
-            ?? ""
+        let raw = decode(accumulatedData)
         let fullAttr = ANSIParser.parse(raw)
         // The SIGWINCH re-render includes the full Ink UI (input area,
         // tab bar, content). Trim to start from "Current session".
@@ -355,16 +367,9 @@ final class UsageViewModel: ObservableObject {
             return
         }
         log.error("handleTimeout() fired qid=\(queryId) stage=\(String(describing: self.stage))")
-        let stageName: String
-        switch stage {
-        case .idle:             stageName = "idle"
-        case .waitingForBanner: stageName = "waitingForBanner"
-        case .waitingForResult: stageName = "waitingForResult"
-        case .capturing:        stageName = "capturing"
-        }
         let tail = String(scanBuffer.suffix(500))
         // Set error BEFORE tearing down so finalize()'s guard exits early.
-        state = .error("Timed out (stage: \(stageName))\n\nLast output:\n\(tail)")
+        state = .error("Timed out (stage: \(String(describing: stage)))\n\nLast output:\n\(tail)")
         teardownSession()
     }
 
@@ -391,7 +396,7 @@ final class UsageViewModel: ObservableObject {
             let fd = masterFd
             log.info("dismissPopover() sending ESC fd=\(fd)")
             DispatchQueue.global(qos: .userInitiated).async {
-                "\u{1B}".withCString { ptr in _ = write(fd, ptr, strlen(ptr)) }
+                ptySend("\u{1B}", to: fd)
             }
         }
         cancelQuery()
