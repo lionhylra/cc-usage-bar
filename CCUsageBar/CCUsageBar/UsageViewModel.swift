@@ -52,7 +52,8 @@ final class UsageViewModel: ObservableObject {
     private enum Stage {
         case idle               // session alive, no active query — discard incoming data
         case waitingForBanner   // waiting for "Claude Code v2"
-        case waitingForResult   // sent /usage, waiting for "Current session"
+        case waitingForPrompt   // sent /usage, waiting for echo before sending \r
+        case waitingForResult   // sent \r, waiting for "Current session"
         case capturing          // collecting final output
     }
 
@@ -92,22 +93,17 @@ final class UsageViewModel: ObservableObject {
         if sessionLive {
             // Reuse the existing claude session — send /usage directly.
             log.info("run() reusing session fd=\(self.masterFd)")
-            stage = .waitingForResult
+            stage = .waitingForPrompt
             let capturedMaster = masterFd
             readSource = makeReadSource(master: capturedMaster, queryId: currentQueryId)
             readSource?.resume()
 
             // ESC was already sent on popover dismiss (see dismissPopover()), so the
-            // REPL is back at the › prompt. Mirror the first-launch timing with a short
-            // delay before the command and a separate newline write.
+            // REPL is back at the › prompt. Send /usage and wait for the echo before
+            // sending \r — avoids a fixed delay that can misfire if the REPL isn't ready.
             log.info("write /usage fd=\(capturedMaster)")
             let n = ptySend("/usage", to: capturedMaster)
             log.info("write /usage result=\(n) errno=\(errno)")
-            DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + 0.3) {
-                log.info("write \\r fd=\(capturedMaster)")
-                let n2 = ptySend("\r", to: capturedMaster)
-                log.info("write \\r result=\(n2) errno=\(errno)")
-            }
             scheduleTimeout(queryId: currentQueryId)
         } else {
             // Launch a fresh claude session.
@@ -260,11 +256,18 @@ final class UsageViewModel: ObservableObject {
                         }
                     } else if self.scanBuffer.range(of: "Claude Code v\\d+", options: .regularExpression) != nil {
                         log.info("→ banner detected, sending /usage")
-                        self.stage = .waitingForResult
-                        // Delay before sending command — the banner appears before the REPL
-                        // is fully interactive. Send /usage then \r with a short gap.
+                        self.stage = .waitingForPrompt
+                        self.scanBuffer = ""
                         ptySend("/usage", to: master)
-                        DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + 0.3) {
+                    }
+                case .waitingForPrompt:
+                    // Wait for the REPL to echo "/usage" back before sending \r.
+                    // This avoids a fixed delay and ensures the prompt is interactive.
+                    if self.scanBuffer.contains("/usage") {
+                        log.info("→ /usage echo detected, sending \\r")
+                        self.stage = .waitingForResult
+                        self.scanBuffer = ""
+                        DispatchQueue.global(qos: .userInitiated).async {
                             ptySend("\r", to: master)
                         }
                     }
